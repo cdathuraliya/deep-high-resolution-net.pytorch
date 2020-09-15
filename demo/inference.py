@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import argparse
 import csv
+import yaml
 import os
 import shutil
 
@@ -14,6 +15,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
+from torch.autograd import Variable
 import torchvision.transforms as transforms
 import torchvision
 import cv2
@@ -29,6 +31,9 @@ from config import cfg
 from config import update_config
 from core.inference import get_final_preds
 from utils.transforms import get_affine_transform
+from yolo.yolov3 import YOLOv3
+from yolo.utils import preprocess, postprocess, yolobox2label
+from yolo.parse_yolo_weights import parse_yolo_weights
 
 CTX = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -86,6 +91,31 @@ def get_person_detection_boxes(model, img, threshold=0.5):
     for pred_class, pred_box, pred_score in zip(pred_classes, pred_boxes, pred_scores):
         if (pred_score > threshold) and (pred_class == 'person'):
             person_boxes.append(pred_box)
+
+    return person_boxes
+
+
+# Based on https://github.com/DeNA/PyTorch_YOLOv3/blob/master/demo.py
+def get_person_detection_boxes_yolo(model, img, imgsize, confthre, nmsthre):
+    img, info_img = preprocess(img, imgsize, jitter=0)
+    img = np.transpose(img / 255., (2, 0, 1))
+    img = torch.from_numpy(img).float().unsqueeze(0)
+    img = Variable(img.type(torch.cuda.FloatTensor))
+
+    person_boxes = []
+    person_scores = []
+    with torch.no_grad():
+        outputs = model(img)
+        outputs = postprocess(outputs, 80, confthre, nmsthre)
+        if outputs[0] is None:
+            print('No person detections.')
+            return
+        for x1, y1, x2, y2, conf, cls_conf, cls_pred in outputs[0]:
+            if int(cls_pred) == 0:
+                box = yolobox2label([y1, x1, y2, x2], info_img)
+                person_boxes.append([(int(box[1]), int(box[0])),
+                                     (int(box[3]), int(box[2]))])
+                person_scores.append(float(cls_conf))
 
     return person_boxes
 
@@ -214,6 +244,17 @@ def main():
     pose_dir = prepare_output_dirs(args.outputDir)
     csv_output_rows = []
 
+    # Based on https://github.com/DeNA/PyTorch_YOLOv3/blob/master/demo.py
+    with open('yolov3_default.cfg', 'r') as f:
+        cfg_yolo = yaml.load(f)
+    imgsize = cfg_yolo['TEST']['IMGSIZE']
+    model_yolo = YOLOv3(cfg_yolo['MODEL'])
+    confthre = cfg_yolo['TEST']['CONFTHRE']
+    nmsthre = cfg_yolo['TEST']['NMSTHRE']
+    model_yolo.to(CTX)
+    parse_yolo_weights(model_yolo, 'yolov3.weights')
+    model_yolo.eval()
+
     box_model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
     box_model.to(CTX)
     box_model.eval()
@@ -269,7 +310,10 @@ def main():
 
         # object detection box
         now = time.time()
-        pred_boxes = get_person_detection_boxes(box_model, image_per, threshold=0.9)
+        # Comment one of two below to switch between Faster R-CNN and YOLO
+        # pred_boxes = get_person_detection_boxes(box_model, image_per, threshold=0.9)
+        pred_boxes = get_person_detection_boxes_yolo(model_yolo, image_per,
+                                                     imgsize, confthre, nmsthre)
         then = time.time()
         print("Find person bbox in: {} sec".format(then - now))
 
